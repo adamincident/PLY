@@ -15,32 +15,22 @@ log = logging.getLogger(__name__)
 # Config
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
 CHAT_ID           = os.environ.get("CHAT_ID", "")
-POLL_INTERVAL     = 120           # check every 2 minutes
+POLL_INTERVAL     = 120
 PAPER_TRADE_FILE  = "copy_trades.json"
 STARTING_BANKROLL = 1000.0
 DAILY_LOSS_LIMIT  = 0.05
 DRAWDOWN_LIMIT    = 0.20
-MAX_BET_PCT       = 0.05          # max 5% of bankroll per trade
-COPY_RATIO        = 0.10          # bet 10% of what they bet proportionally
+MAX_BET_PCT       = 0.05
+COPY_RATIO        = 0.10
 MAX_WALLETS       = 10
  
-# Minimum requirements for a wallet to be tracked
-MIN_WIN_RATE      = 0.58          # at least 58% win rate
-MIN_TRADES        = 20            # at least 20 resolved trades
-MIN_PROFIT        = 500           # at least $500 total profit
-MIN_VOLUME        = 1000          # at least $1000 total volume
+# Wallet quality filters
+MIN_WIN_RATE      = 0.55
+MIN_TRADES        = 10
+MIN_PROFIT        = 200
  
-# Polymarket API endpoints
-GAMMA_URL = "https://gamma-api.polymarket.com"
 DATA_URL  = "https://data-api.polymarket.com"
-CLOB_URL  = "https://clob.polymarket.com"
- 
-# Known profitable wallets to seed with (top public traders)
-# These will be validated and more will be discovered automatically
-SEED_WALLETS = [
-    "0x1d0034134e4759b574d7a85a7d234f1f0a2df38c",  # from the tweet you shared
-    "0x594edB9112f526Fa6A80b8F858A6379C8A2c1C11",
-]
+GAMMA_URL = "https://gamma-api.polymarket.com"
  
 # Storage
  
@@ -84,166 +74,172 @@ def send_telegram(text):
         log.error("Telegram failed: " + str(e))
         return False
  
-# Polymarket API
+# Polymarket API helpers
  
-def get_wallet_stats(address):
+def safe_get(url, params=None):
     try:
-        url = DATA_URL + "/profiles/" + address
-        r = requests.get(url, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception as e:
-        log.warning("Profile fetch failed for " + address + ": " + str(e))
-        return None
- 
-def get_wallet_positions(address):
-    try:
-        url = DATA_URL + "/positions"
-        params = {"user": address, "limit": 100}
         r = requests.get(url, params=params, timeout=15)
         if r.status_code == 200:
             return r.json()
-        return []
+        log.warning("API " + url + " returned " + str(r.status_code))
+        return None
     except Exception as e:
-        log.warning("Positions fetch failed: " + str(e))
-        return []
+        log.warning("API error " + url + ": " + str(e))
+        return None
  
-def get_wallet_trades(address):
-    try:
-        url = DATA_URL + "/trades"
-        params = {"maker": address, "limit": 100}
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        return []
-    except Exception as e:
-        log.warning("Trades fetch failed: " + str(e))
-        return []
+# Leaderboard - get top wallets by PnL
  
 def get_leaderboard():
-    try:
-        url = DATA_URL + "/leaderboard"
-        params = {"limit": 50, "window": "all"}
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        # Try alternative endpoint
-        url2 = GAMMA_URL + "/leaderboard"
-        r2 = requests.get(url2, params=params, timeout=15)
-        if r2.status_code == 200:
-            return r2.json()
-        return []
-    except Exception as e:
-        log.warning("Leaderboard fetch failed: " + str(e))
-        return []
+    log.info("Fetching leaderboard...")
+    addresses = []
  
-def get_recent_trades_for_wallet(address):
-    try:
-        url = DATA_URL + "/trades"
-        params = {"maker": address, "limit": 20}
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                return data.get("data", data.get("trades", []))
-        return []
-    except Exception as e:
-        log.warning("Recent trades fetch failed: " + str(e))
-        return []
+    # Try multiple periods to get more addresses
+    for period in ["all", "monthly", "weekly"]:
+        result = safe_get(DATA_URL + "/leaderboard", {
+            "limit": 30,
+            "window": period,
+            "order_by": "profit"
+        })
+        if result:
+            if isinstance(result, list):
+                entries = result
+            elif isinstance(result, dict):
+                entries = result.get("data", result.get("leaderboard", []))
+            else:
+                entries = []
  
-# Wallet analysis
+            for entry in entries:
+                addr = (
+                    entry.get("proxyWallet") or
+                    entry.get("address") or
+                    entry.get("user") or
+                    entry.get("proxy_wallet", "")
+                )
+                if addr and addr not in addresses:
+                    addresses.append(addr)
  
-def analyze_wallet(address):
-    log.info("  Analyzing wallet: " + address[:20] + "...")
+        time.sleep(0.5)
  
-    profile = get_wallet_stats(address)
-    trades = get_wallet_trades(address)
+    log.info("Got " + str(len(addresses)) + " addresses from leaderboard")
+    return addresses
  
-    if not trades:
-        log.info("  No trade history found")
-        return None
+# Calculate wallet PnL from trades + activity
  
-    if isinstance(trades, dict):
-        trades = trades.get("data", trades.get("trades", []))
- 
-    if len(trades) < MIN_TRADES:
-        log.info("  Not enough trades: " + str(len(trades)))
-        return None
- 
-    # Calculate stats from trades
+def calculate_wallet_pnl(address):
+    total_invested = 0.0
+    total_returned = 0.0
+    trade_count = 0
     wins = 0
     losses = 0
-    total_profit = 0.0
-    total_volume = 0.0
  
-    for trade in trades:
-        size = float(trade.get("size", 0) or 0)
-        price = float(trade.get("price", 0) or 0)
-        side = trade.get("side", "").upper()
-        total_volume += size * price
+    # Fetch trades
+    trades = safe_get(DATA_URL + "/trades", {"maker": address, "limit": 100})
+    if not trades:
+        trades = safe_get(DATA_URL + "/activity", {"user": address, "type": "TRADE", "limit": 100})
  
-    # Try to get profit from profile
-    profit = 0.0
-    win_rate = 0.0
+    if trades:
+        if isinstance(trades, dict):
+            trades = trades.get("data", trades.get("trades", []))
+        if isinstance(trades, list):
+            for t in trades:
+                size = float(t.get("size", 0) or 0)
+                price = float(t.get("price", 0) or 0)
+                side = str(t.get("side", "")).upper()
+                cost = size * price
+                if side == "BUY":
+                    total_invested += cost
+                    trade_count += 1
+                elif side == "SELL":
+                    total_returned += cost
  
-    if profile:
-        profit = float(profile.get("profit", profile.get("pnl", 0)) or 0)
-        win_rate_raw = profile.get("winRate", profile.get("win_rate", 0))
-        if win_rate_raw:
-            win_rate = float(win_rate_raw)
-            if win_rate > 1:
-                win_rate = win_rate / 100
+    # Fetch redemptions (actual winnings)
+    activity = safe_get(DATA_URL + "/activity", {"user": address, "type": "REDEEM", "limit": 100})
+    if activity:
+        if isinstance(activity, dict):
+            activity = activity.get("data", activity.get("activity", []))
+        if isinstance(activity, list):
+            for a in activity:
+                val = float(a.get("value", 0) or a.get("amount", 0) or 0)
+                total_returned += val
+                wins += 1
  
-    if total_volume < MIN_VOLUME:
-        log.info("  Volume too low: $" + str(round(total_volume, 2)))
-        return None
+    # Closed positions
+    closed = safe_get(DATA_URL + "/closed-positions", {"user": address, "limit": 100})
+    if closed:
+        if isinstance(closed, dict):
+            closed = closed.get("data", [])
+        if isinstance(closed, list):
+            for p in closed:
+                cash_pnl = float(p.get("cashPnl", 0) or 0)
+                if cash_pnl > 0:
+                    wins += 1
+                elif cash_pnl < 0:
+                    losses += 1
  
-    if profit < MIN_PROFIT:
-        log.info("  Profit too low: $" + str(round(profit, 2)))
-        return None
+    realized_pnl = total_returned - total_invested
+    total_resolved = wins + losses
+    win_rate = wins / total_resolved if total_resolved > 0 else 0
  
-    if win_rate < MIN_WIN_RATE and win_rate > 0:
-        log.info("  Win rate too low: " + str(round(win_rate * 100, 1)) + "%")
-        return None
- 
-    wallet_info = {
-        "address": address,
-        "profit": round(profit, 2),
-        "win_rate": round(win_rate * 100, 1),
-        "total_trades": len(trades),
-        "total_volume": round(total_volume, 2),
-        "last_checked": datetime.now().isoformat(),
-        "last_trade_id": trades[0].get("id", "") if trades else ""
+    return {
+        "profit": round(realized_pnl, 2),
+        "win_rate": round(win_rate, 3),
+        "trade_count": trade_count,
+        "wins": wins,
+        "losses": losses
     }
  
-    log.info("  GOOD WALLET: profit=$" + str(wallet_info["profit"]) + " winrate=" + str(wallet_info["win_rate"]) + "%")
-    return wallet_info
+def analyze_wallet(address):
+    log.info("  Analyzing: " + address[:20] + "...")
+ 
+    stats = calculate_wallet_pnl(address)
+ 
+    log.info("  profit=$" + str(stats["profit"]) +
+             " winrate=" + str(round(stats["win_rate"] * 100, 1)) + "%" +
+             " trades=" + str(stats["trade_count"]))
+ 
+    if stats["trade_count"] < MIN_TRADES:
+        log.info("  Skip: not enough trades")
+        return None
+ 
+    if stats["profit"] < MIN_PROFIT:
+        log.info("  Skip: profit too low")
+        return None
+ 
+    if stats["win_rate"] < MIN_WIN_RATE and stats["wins"] + stats["losses"] > 5:
+        log.info("  Skip: win rate too low")
+        return None
+ 
+    # Get most recent trade ID for change detection
+    last_trade_id = ""
+    recent = safe_get(DATA_URL + "/trades", {"maker": address, "limit": 1})
+    if recent:
+        if isinstance(recent, dict):
+            recent = recent.get("data", [])
+        if isinstance(recent, list) and recent:
+            last_trade_id = str(recent[0].get("id", ""))
+ 
+    return {
+        "address": address,
+        "profit": stats["profit"],
+        "win_rate": round(stats["win_rate"] * 100, 1),
+        "trade_count": stats["trade_count"],
+        "wins": stats["wins"],
+        "losses": stats["losses"],
+        "last_trade_id": last_trade_id,
+        "last_checked": datetime.now().isoformat()
+    }
  
 def discover_wallets():
     log.info("Discovering profitable wallets...")
     good_wallets = []
  
-    # Try leaderboard first
-    leaderboard = get_leaderboard()
-    addresses = []
+    addresses = get_leaderboard()
  
-    if leaderboard:
-        if isinstance(leaderboard, list):
-            for entry in leaderboard[:30]:
-                addr = entry.get("address", entry.get("user", entry.get("proxyWallet", "")))
-                if addr:
-                    addresses.append(addr)
-        log.info("Found " + str(len(addresses)) + " addresses from leaderboard")
+    if not addresses:
+        log.warning("No addresses from leaderboard, leaderboard API may be unavailable")
+        send_telegram("⚠️ Could not fetch leaderboard. Will retry next cycle.")
+        return []
  
-    # Add seed wallets
-    for addr in SEED_WALLETS:
-        if addr not in addresses:
-            addresses.append(addr)
- 
-    # Analyze each
     for address in addresses:
         if len(good_wallets) >= MAX_WALLETS:
             break
@@ -251,6 +247,7 @@ def discover_wallets():
             wallet = analyze_wallet(address)
             if wallet:
                 good_wallets.append(wallet)
+                log.info("  ADDED: " + address[:20] + " profit=$" + str(wallet["profit"]))
             time.sleep(1)
         except Exception as e:
             log.warning("Error analyzing " + address[:20] + ": " + str(e))
@@ -258,7 +255,7 @@ def discover_wallets():
     log.info("Found " + str(len(good_wallets)) + " qualifying wallets")
     return good_wallets
  
-# Copy trading logic
+# Copy trade logic
  
 def check_risk_limits(data):
     bankroll = data["bankroll"]
@@ -272,9 +269,9 @@ def check_risk_limits(data):
     if drawdown >= DRAWDOWN_LIMIT:
         send_telegram(
             "🚨 <b>DRAWDOWN ALERT</b>\n\n"
-            "Bankroll dropped " + str(round(drawdown * 100, 1)) + "% from peak\n"
+            "Down " + str(round(drawdown * 100, 1)) + "% from peak\n"
             "Peak: $" + str(round(peak, 2)) + "\n"
-            "Current: $" + str(round(bankroll, 2)) + "\n\n"
+            "Now: $" + str(round(bankroll, 2)) + "\n\n"
             "Bot paused."
         )
         return False
@@ -285,7 +282,6 @@ def check_risk_limits(data):
         for t in data["trades"]
         if t.get("status") == "lost" and t.get("timestamp", "").startswith(today)
     )
- 
     if daily_loss / STARTING_BANKROLL >= DAILY_LOSS_LIMIT:
         send_telegram(
             "⛔ <b>DAILY LOSS LIMIT HIT</b>\n\n"
@@ -296,65 +292,67 @@ def check_risk_limits(data):
  
     return True
  
-def calculate_copy_size(bankroll, their_bet_size):
-    # Bet proportionally — 10% of what they bet relative to our bankroll
-    raw = their_bet_size * COPY_RATIO
+def calculate_copy_size(bankroll, their_bet):
+    raw = their_bet * COPY_RATIO
     max_bet = bankroll * MAX_BET_PCT
     return round(min(raw, max_bet), 2)
  
-def check_wallet_for_new_trades(wallet, data):
+def get_new_trades(wallet):
     address = wallet["address"]
-    last_trade_id = wallet.get("last_trade_id", "")
-    new_trades = []
+    last_id = wallet.get("last_trade_id", "")
  
-    recent = get_recent_trades_for_wallet(address)
+    recent = safe_get(DATA_URL + "/trades", {"maker": address, "limit": 10})
     if not recent:
         return []
  
+    if isinstance(recent, dict):
+        recent = recent.get("data", [])
+    if not isinstance(recent, list):
+        return []
+ 
+    new_trades = []
     for trade in recent:
         trade_id = str(trade.get("id", ""))
-        if trade_id == last_trade_id:
+        if trade_id == last_id:
             break
         new_trades.append(trade)
  
     if new_trades:
         wallet["last_trade_id"] = str(recent[0].get("id", ""))
         wallet["last_checked"] = datetime.now().isoformat()
-        log.info("  Found " + str(len(new_trades)) + " new trades for " + address[:20])
  
     return new_trades
  
 def place_copy_trade(wallet, original_trade, data):
     bankroll = data["bankroll"]
+    size = float(original_trade.get("size", 0) or 0)
+    price = float(original_trade.get("price", 0) or 0)
+    their_bet = size * price
  
-    their_size = float(original_trade.get("size", 0) or 0)
-    their_price = float(original_trade.get("price", 0) or 0)
-    their_bet = their_size * their_price
- 
-    if their_bet < 1:
+    if their_bet < 0.50:
         return None
  
     bet_size = calculate_copy_size(bankroll, their_bet)
-    if bet_size < 0.50:
+    if bet_size < 0.25:
         return None
  
-    outcome = original_trade.get("outcome", original_trade.get("side", "Unknown"))
-    market_id = original_trade.get("market", original_trade.get("conditionId", "Unknown"))
-    question = original_trade.get("title", original_trade.get("question", "Market " + str(market_id)[:20]))
+    side = str(original_trade.get("side", "BUY")).upper()
+    outcome = original_trade.get("outcome", side)
+    title = original_trade.get("title", "Unknown market")
  
     trade = {
         "id": str(original_trade.get("id", "")),
-        "question": question,
-        "market_id": str(market_id),
+        "question": title,
         "copied_from": wallet["address"],
-        "copied_from_short": wallet["address"][:10] + "...",
+        "wallet_short": wallet["address"][:10] + "...",
         "wallet_win_rate": wallet["win_rate"],
         "wallet_profit": wallet["profit"],
         "pick": outcome,
+        "side": side,
         "their_bet": round(their_bet, 2),
-        "their_price": their_price,
+        "their_price": round(price, 3),
         "bet_size": bet_size,
-        "potential_profit": round(bet_size * (1 - their_price) / their_price, 2) if their_price > 0 else 0,
+        "potential_profit": round(bet_size * (1 - price) / price, 2) if price > 0 and price < 1 else 0,
         "timestamp": datetime.now().isoformat(),
         "status": "pending",
         "result": None
@@ -367,19 +365,19 @@ def place_copy_trade(wallet, original_trade, data):
     return trade
  
 def format_copy_trade(trade):
-    msg = (
+    return (
         "📋 <b>COPY TRADE</b>\n\n"
         "📌 <b>Market:</b> " + trade["question"] + "\n\n"
         "✅ <b>Pick:</b> " + str(trade["pick"]) + "\n"
-        "👛 <b>Copying:</b> " + trade["copied_from_short"] + "\n"
-        "🏆 <b>Wallet Win Rate:</b> " + str(trade["wallet_win_rate"]) + "%\n"
-        "💰 <b>Wallet Total Profit:</b> $" + str(trade["wallet_profit"]) + "\n\n"
-        "📊 <b>Their Bet:</b> $" + str(trade["their_bet"]) + " @ " + str(round(trade["their_price"] * 100, 1)) + "¢\n"
-        "💵 <b>Our Paper Bet:</b> $" + str(trade["bet_size"]) + "\n"
-        "💸 <b>Potential Profit:</b> $" + str(trade["potential_profit"]) + "\n\n"
-        "⏰ <b>Time:</b> " + trade["timestamp"][:16].replace("T", " ")
+        "📊 <b>Price:</b> " + str(round(trade["their_price"] * 100, 1)) + "¢\n\n"
+        "👛 <b>Copying:</b> " + trade["wallet_short"] + "\n"
+        "🏆 <b>Win Rate:</b> " + str(trade["wallet_win_rate"]) + "%\n"
+        "💰 <b>Their Total Profit:</b> $" + str(trade["wallet_profit"]) + "\n\n"
+        "💵 <b>Their Bet:</b> $" + str(trade["their_bet"]) + "\n"
+        "💸 <b>Our Paper Bet:</b> $" + str(trade["bet_size"]) + "\n"
+        "📈 <b>Potential Profit:</b> $" + str(trade["potential_profit"]) + "\n\n"
+        "⏰ " + trade["timestamp"][:16].replace("T", " ")
     )
-    return msg
  
 def format_stats(data):
     stats = data["stats"]
@@ -390,7 +388,7 @@ def format_stats(data):
         "📊 <b>COPY TRADING STATS</b>\n\n"
         "<b>Bankroll:</b> $" + str(round(data["bankroll"], 2)) + "\n"
         "<b>Total P&L:</b> $" + str(round(stats["profit"], 2)) + "\n"
-        "<b>Total Copies:</b> " + str(stats["total"]) + "\n"
+        "<b>Copies Made:</b> " + str(stats["total"]) + "\n"
         "<b>Wins:</b> " + str(stats["wins"]) + "\n"
         "<b>Losses:</b> " + str(stats["losses"]) + "\n"
         "<b>Pending:</b> " + str(stats["pending"]) + "\n"
@@ -408,22 +406,24 @@ def run_cycle(data):
         return data
  
     wallets = data.get("tracked_wallets", [])
+ 
     if not wallets:
-        log.info("No wallets tracked yet, discovering...")
+        log.info("No wallets yet, discovering...")
         wallets = discover_wallets()
         data["tracked_wallets"] = wallets
         save_data(data)
  
         if wallets:
-            wallet_list = "\n".join([
-                "👛 " + w["address"][:16] + "... | +" + str(w["profit"]) + " | " + str(w["win_rate"]) + "% WR"
+            lines = [
+                "👛 " + w["address"][:16] + "... | $" + str(w["profit"]) + " profit | " + str(w["win_rate"]) + "% WR"
                 for w in wallets
-            ])
+            ]
             send_telegram(
-                "🔍 <b>TRACKING " + str(len(wallets)) + " WALLETS</b>\n\n" + wallet_list
+                "🔍 <b>TRACKING " + str(len(wallets)) + " WALLETS</b>\n\n" +
+                "\n".join(lines)
             )
         else:
-            send_telegram("⚠️ No qualifying wallets found yet. Will retry next cycle.")
+            send_telegram("⚠️ No qualifying wallets found yet. Retrying next cycle.")
             return data
  
     # Check each wallet for new trades
@@ -431,35 +431,36 @@ def run_cycle(data):
  
     for wallet in wallets:
         try:
-            new_trades = check_wallet_for_new_trades(wallet, data)
+            new_trades = get_new_trades(wallet)
             for trade in new_trades:
                 trade_id = str(trade.get("id", ""))
                 if trade_id in pending_ids:
+                    continue
+                # Only copy BUY trades
+                if str(trade.get("side", "")).upper() != "BUY":
                     continue
  
                 copy = place_copy_trade(wallet, trade, data)
                 if copy:
                     new_copies += 1
                     send_telegram(format_copy_trade(copy))
-                    log.info("  Copied trade from " + wallet["address"][:16])
+                    log.info("  Copied from " + wallet["address"][:16])
  
             time.sleep(1)
         except Exception as e:
-            log.warning("Error checking wallet " + wallet["address"][:16] + ": " + str(e))
+            log.warning("Wallet check error " + wallet["address"][:16] + ": " + str(e))
  
-    # Refresh wallet list every 24 hours
+    # Refresh wallet list every 6 hours
     if wallets:
-        last_checked = wallets[0].get("last_checked", "")
-        if last_checked:
-            try:
-                last = datetime.fromisoformat(last_checked)
-                if (datetime.now() - last).total_seconds() > 86400:
-                    log.info("Refreshing wallet list...")
-                    new_wallets = discover_wallets()
-                    if new_wallets:
-                        data["tracked_wallets"] = new_wallets
-            except Exception:
-                pass
+        try:
+            last = datetime.fromisoformat(wallets[0].get("last_checked", datetime.now().isoformat()))
+            if (datetime.now() - last).total_seconds() > 21600:
+                log.info("Refreshing wallet list...")
+                fresh = discover_wallets()
+                if fresh:
+                    data["tracked_wallets"] = fresh
+        except Exception:
+            pass
  
     log.info("Cycle done. " + str(new_copies) + " new copies.")
  
@@ -472,14 +473,13 @@ def run_cycle(data):
 def main():
     log.info("Polymarket Copy Bot starting (Phase 1 - Paper Trading)")
     log.info("Bankroll: $" + str(STARTING_BANKROLL))
-    log.info("Tracking up to " + str(MAX_WALLETS) + " wallets")
+    log.info("Max wallets: " + str(MAX_WALLETS))
     log.info("Min win rate: " + str(int(MIN_WIN_RATE * 100)) + "%")
     log.info("Min profit: $" + str(MIN_PROFIT))
     log.info("Poll interval: " + str(POLL_INTERVAL) + "s")
  
     data = load_data()
-    log.info("Loaded " + str(len(data["trades"])) + " existing trades")
-    log.info("Tracking " + str(len(data.get("tracked_wallets", []))) + " wallets")
+    log.info("Loaded " + str(len(data["trades"])) + " trades, " + str(len(data.get("tracked_wallets", []))) + " wallets")
  
     send_telegram(
         "🤖 <b>Polymarket Copy Bot Started</b>\n\n"
@@ -491,7 +491,7 @@ def main():
         "Min Profit: $" + str(MIN_PROFIT) + "\n"
         "Daily Loss Limit: " + str(int(DAILY_LOSS_LIMIT * 100)) + "%\n"
         "Drawdown Limit: " + str(int(DRAWDOWN_LIMIT * 100)) + "%\n\n"
-        "Scanning for winning wallets..."
+        "Scanning leaderboard..."
     )
  
     while True:
