@@ -1,1 +1,1 @@
-worker: python polybot.py
+worker: python copybot.py
