@@ -94,11 +94,11 @@ def get_leaderboard():
     addresses = []
  
     # Try multiple periods to get more addresses
-    for period in ["all", "monthly", "weekly"]:
-        result = safe_get(DATA_URL + "/leaderboard", {
-            "limit": 30,
-            "window": period,
-            "order_by": "profit"
+    for period in ["ALL", "MONTH", "WEEK"]:
+        result = safe_get(DATA_URL + "/v1/leaderboard", {
+            "limit": 50,
+            "timePeriod": period,
+            "orderBy": "PNL"
         })
         if result:
             if isinstance(result, list):
