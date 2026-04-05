@@ -19,7 +19,7 @@ CHAT_ID          = os.environ.get("CHAT_ID", "")
 ANTHROPIC_KEY    = os.environ.get("ANTHROPIC_KEY", "")
 POLL_INTERVAL    = 1200        # check every 20 minutes
 MIN_CONFIDENCE   = 65          # only alert if confidence >= 65%
-MAX_VOLUME       = 1000000     # ignore tiny markets under $1M volume
+MAX_VOLUME       = 10000     # ignore tiny markets under $1M volume
 PAPER_TRADE_FILE = "paper_trades.json"
 DAILY_LOSS_LIMIT = 0.05        # stop if down 5% in a day
 DRAWDOWN_LIMIT   = 0.20        # pause if down 20% from peak
@@ -104,8 +104,9 @@ def filter_markets(markets):
                     if len(price_list) == 2:
                         p1 = float(price_list[0])
                         p2 = float(price_list[1])
-                        if 0.38 <= p1 <= 0.62 and 0.38 <= p2 <= 0.62:
+                        if 0.45 <= p1 <= 0.55 and 0.45 <= p2 <= 0.55:
                             continue
+
                 except Exception:
                     pass
 
