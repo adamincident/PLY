@@ -468,17 +468,20 @@ def send_telegram(text):
 def format_pick(trade, market):
     volume = get_volume(market)
     vol_str = "$" + str(round(volume / 1000, 1)) + "K"
+    end = str(trade.get("end_date", ""))[:10] or "Unknown"
+
     msg = (
         "🎯 <b>NEW PAPER TRADE</b>\n\n"
-        "<b>Market:</b> " + trade["question"] + "\n\n"
-        "<b>Pick:</b> " + str(trade["pick"]) + "\n"
-        "<b>Confidence:</b> " + str(trade["confidence"]) + "%\n"
-        "<b>Edge:</b> +" + str(trade["edge"]) + "%\n"
-        "<b>Paper Bet:</b> $" + str(trade["bet_size"]) + "\n"
-        "<b>Potential Profit:</b> $" + str(trade["potential_profit"]) + "\n"
-        "<b>Volume:</b> " + vol_str + "\n\n"
-        "<b>Why:</b> " + str(trade["reasoning"]) + "\n\n"
-        "<b>Risk:</b> " + str(trade["risk_factors"])
+        "📋 <b>" + trade["question"] + "</b>\n\n"
+        "✅ <b>Pick:</b> " + str(trade["pick"]) + "\n"
+        "🎯 <b>Confidence:</b> " + str(trade["confidence"]) + "%\n"
+        "📈 <b>Edge:</b> +" + str(trade["edge"]) + "%\n"
+        "💵 <b>Paper Bet:</b> $" + str(trade["bet_size"]) + "\n"
+        "💰 <b>Potential Profit:</b> $" + str(trade["potential_profit"]) + "\n"
+        "📊 <b>Volume:</b> " + vol_str + "\n"
+        "⏰ <b>Resolves:</b> " + end + "\n\n"
+        "🧠 <b>Reasoning:</b>\n" + str(trade["reasoning"]) + "\n\n"
+        "⚠️ <b>Risk:</b>\n" + str(trade["risk_factors"])
     )
     return msg
  
