@@ -1,0 +1,142 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BotMode {
+  PAPER
+  LIVE
+}
+
+enum SignalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXECUTED
+  EXPIRED
+}
+
+model Wallet {
+  id              String        @id @default(cuid())
+  address         String        @unique
+  label           String?
+  score           Float         @default(0)
+  consistency     Float         @default(0)
+  tradeCount      Int           @default(0)
+  recencyScore    Float         @default(0)
+  drawdownProxy   Float         @default(0)
+  diversification Float         @default(0)
+  isActive        Boolean       @default(true)
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  walletTrades    WalletTrade[]
+}
+
+model Market {
+  id             String      @id @default(cuid())
+  externalId     String      @unique
+  slug           String?
+  question       String
+  status         String
+  active         Boolean     @default(true)
+  lastPrice      Decimal?    @db.Decimal(10, 6)
+  bestBid        Decimal?    @db.Decimal(10, 6)
+  bestAsk        Decimal?    @db.Decimal(10, 6)
+  volume24h      Decimal?    @db.Decimal(18, 6)
+  liquidityScore Decimal?    @db.Decimal(18, 6)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  walletTrades   WalletTrade[]
+  signals        Signal[]
+  positions      Position[]
+}
+
+model WalletTrade {
+  id           String    @id @default(cuid())
+  externalId   String    @unique
+  walletId     String
+  marketId     String
+  side         String
+  outcome      String?
+  price        Decimal   @db.Decimal(10, 6)
+  size         Decimal   @db.Decimal(18, 6)
+  amount       Decimal   @db.Decimal(18, 6)
+  executedAt   DateTime
+  ingestedAt   DateTime  @default(now())
+  rawPayload   Json
+  wallet       Wallet    @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  market       Market    @relation(fields: [marketId], references: [id], onDelete: Cascade)
+}
+
+model Signal {
+  id              String       @id @default(cuid())
+  marketId        String
+  sourceTradeId   String?
+  side            String
+  outcome         String?
+  entryPrice      Decimal      @db.Decimal(10, 6)
+  confidence      Float        @default(0)
+  freshnessMs     Int
+  slippageBps     Int
+  spreadBps       Int
+  status          SignalStatus @default(PENDING)
+  duplicateKey    String?      @unique
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  market          Market       @relation(fields: [marketId], references: [id], onDelete: Cascade)
+  sourceTrade     WalletTrade? @relation(fields: [sourceTradeId], references: [id], onDelete: SetNull)
+  paperTrades     PaperTrade[]
+}
+
+model Portfolio {
+  id              String      @id @default(cuid())
+  mode            BotMode     @default(PAPER)
+  cash            Decimal     @db.Decimal(18, 6)
+  equity          Decimal     @db.Decimal(18, 6)
+  dailyPnl        Decimal     @db.Decimal(18, 6)
+  totalPnl        Decimal     @db.Decimal(18, 6)
+  maxDailyLoss    Decimal     @db.Decimal(18, 6)
+  maxPositionSize Decimal     @db.Decimal(18, 6)
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  positions       Position[]
+  paperTrades     PaperTrade[]
+}
+
+model Position {
+  id              String    @id @default(cuid())
+  portfolioId     String
+  marketId        String
+  side            String
+  quantity        Decimal   @db.Decimal(18, 6)
+  averagePrice    Decimal   @db.Decimal(10, 6)
+  unrealizedPnl   Decimal   @db.Decimal(18, 6)
+  realizedPnl     Decimal   @db.Decimal(18, 6)
+  openedAt        DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  portfolio       Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  market          Market    @relation(fields: [marketId], references: [id], onDelete: Cascade)
+}
+
+model PaperTrade {
+  id            String    @id @default(cuid())
+  portfolioId   String
+  signalId      String?
+  marketId      String
+  side          String
+  outcome       String?
+  quantity      Decimal   @db.Decimal(18, 6)
+  price         Decimal   @db.Decimal(10, 6)
+  fee           Decimal   @db.Decimal(18, 6) @default(0)
+  status        String
+  placedAt      DateTime  @default(now())
+  settledAt     DateTime?
+  pnl           Decimal?  @db.Decimal(18, 6)
+  portfolio     Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  signal        Signal?   @relation(fields: [signalId], references: [id], onDelete: SetNull)
+  market        Market    @relation(fields: [marketId], references: [id], onDelete: Cascade)
+}
